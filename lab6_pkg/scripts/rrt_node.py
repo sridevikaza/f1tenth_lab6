@@ -42,7 +42,8 @@ class RRT(Node):
 
         # TODO: create subscribers
         self.pose_sub_ = self.create_subscription(
-            PoseStamped,
+            #PoseStamped,
+            Odometry,
             pose_topic,
             self.pose_callback,
             1)
