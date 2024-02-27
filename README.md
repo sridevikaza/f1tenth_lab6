@@ -69,7 +69,7 @@ You'll be rewarded extra credit (10%) for implementing RRT*, or another modified
 - **Deliverable 3**: (As a group) Also include a video of the car running RRT in AIMS hallway.
 
 ## VI: Grading Rubric
-- Compilation: **30** Points
-- Performance on straight path (simulation video): **30** Points
-- Performance on turn (simulation video): **20** Points
-- Group Video: **20** Points
+- Compilation: **10** Points
+- Performance on straight path (simulation video): **15** Points
+- Performance on turn (simulation video): **10** Points
+- Group Video on hardware: **10** Points
