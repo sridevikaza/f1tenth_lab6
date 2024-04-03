@@ -19,6 +19,7 @@
   <depend>visualization_msgs</depend>
   <depend>Eigen3</depend>
   <depend>tf2_ros</depend>
+  <depend>orocos_kdl</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
