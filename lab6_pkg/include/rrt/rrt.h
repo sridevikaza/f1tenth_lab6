@@ -56,6 +56,7 @@ private:
     rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_pub_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr og_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr waypoints_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr tree_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr steer_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr samples_pub;
@@ -80,17 +81,25 @@ private:
     vector<float> y_points;
     double dist_size;
     double resolution;
-    double L;
+    double L_goal;
+    double L_follow;
     double expansion_dist;
     double goal_thresh;
+    double neighbor_thresh;
+    float velocity;
+    float min_steer;
+    float max_steer;
+    float steering_gain;
     int grid_buffer;
     int num_points;
     int grid_size;
     int num_samples;
+    bool rrt_star;
 
     // callbacks
     // where rrt actually happens
-    void pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg);
+    void pose_callback_rrt(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg);
+    void pose_callback_rrt_star(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg);
     // updates occupancy grid
     void scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg);
 
@@ -104,9 +113,14 @@ private:
     void publish_path(std::vector<RRT_Node> path);
     double get_dist(double &x1, double &y1, double &x2, double &y2);
     int get_node_index(const std::vector<RRT_Node> &tree, const RRT_Node &node);  
-    vector<double> getGoal(const double& current_x, const double& current_y);
+    vector<double> get_goal(const double& current_x, const double& current_y, const vector<float>& x_values, const vector<float>& y_values, const double lookahead);
     void load_waypoints(vector<float> &x_points, vector<float> &y_points);
     void publish_markers();
+    void pure_pursuit(const vector<float>& path_x_points, const vector<float>& path_y_points, const geometry_msgs::msg::Pose& car_pose);
+    void transform_path(vector<float>& path_x_points, vector<float>& path_y_points, const vector<RRT_Node>& path);
+    void publish_tree(const std::vector<RRT_Node>& nodes);
+    void clear_tree();
+    void publish_goal(vector<double>);
 
     // RRT* methods
     double cost(std::vector<RRT_Node> &tree, RRT_Node &node);

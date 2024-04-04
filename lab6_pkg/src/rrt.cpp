@@ -14,21 +14,29 @@ RRT::~RRT() {
 // Constructor of the RRT class
 RRT::RRT(): rclcpp::Node("rrt_node"), gen((std::random_device())()), tf_buffer(std::make_shared<tf2_ros::Buffer>(this->get_clock())), tf_listener(*tf_buffer) 
 {
+    // declare params
+    this->declare_parameter<bool>("rrt_star", true);
+    this->get_parameter("rrt_star", rrt_star);
 
     // ROS publishers
-    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>("/drive", 1);
-    og_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/grid", 1);
-    waypoints_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/waypoints", 1);
-    goal_pub = this->create_publisher<visualization_msgs::msg::Marker>("/goal", 1);
-    steer_pub = this->create_publisher<visualization_msgs::msg::Marker>("/steer", 1);
-    samples_pub = this->create_publisher<visualization_msgs::msg::Marker>("/samples", 1);
-    path_pub = this->create_publisher<nav_msgs::msg::Path>("/path", 1);
+    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>("/drive", 10);
+    og_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/grid", 10);
+    waypoints_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/waypoints", 10);
+    tree_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/tree", 10);
+    goal_pub = this->create_publisher<visualization_msgs::msg::Marker>("/goal", 10);
+    steer_pub = this->create_publisher<visualization_msgs::msg::Marker>("/steer", 10);
+    samples_pub = this->create_publisher<visualization_msgs::msg::Marker>("/samples", 10);
+    path_pub = this->create_publisher<nav_msgs::msg::Path>("/path", 10);
 
     // ROS subscribers
-    string pose_topic = "ego_racecar/odom";
+    string pose_topic = "ego_racecar/odom";    
     string scan_topic = "/scan";
-    pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      pose_topic, 1, std::bind(&RRT::pose_callback, this, std::placeholders::_1));
+    if (rrt_star){
+        pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(pose_topic, 1, std::bind(&RRT::pose_callback_rrt_star, this, std::placeholders::_1));
+    }
+    else{
+        pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(pose_topic, 1, std::bind(&RRT::pose_callback_rrt, this, std::placeholders::_1));
+    }
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
       scan_topic, 1, std::bind(&RRT::scan_callback, this, std::placeholders::_1));
 
@@ -46,15 +54,21 @@ RRT::RRT(): rclcpp::Node("rrt_node"), gen((std::random_device())()), tf_buffer(s
     goal_marker = visualization_msgs::msg::Marker();
 
     // set variables
-    grid_buffer = 20; // amount to dialte obstacles (cells)
-    dist_size = 2.5; // ditribution size for random sampling (m)
+    grid_buffer = 15; // amount to dialte obstacles (cells)
+    dist_size = 3.5; // ditribution size for random sampling (m)
     goal_thresh = 0.15; // distance for reaching goal (m)
-    expansion_dist = 0.15; // steer expansion distance (m)
+    expansion_dist = 0.3; // steer expansion distance (m)
     num_points = 100; // num points for interpolate in collision check
     resolution = 0.01; // meters per cell in occupancy grid (m/cell)
-    grid_size = 250; // height and width in occupancy grid (cells)
+    grid_size = 350; // height and width in occupancy grid (cells)
     num_samples = 1000; // number of sampled points (m)
-    L = 2; // lookahead dist for getting a goal waypoint (m)
+    L_goal = 1.5; // lookahead dist for getting a goal waypoint (m)
+    L_follow = 0.4; // lookahead dist for pure pursuit along RRT path (m)
+    velocity = 0.5;
+    min_steer = -M_PI/3;
+    max_steer = M_PI/3;
+    steering_gain = 0.3;
+    neighbor_thresh = 0.6;
 
     // load waypoints
     load_waypoints(x_points, y_points);
@@ -116,10 +130,9 @@ void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_m
             }
         }
     }
-    // og_pub_->publish(og_);
 }
 
-void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) {
+void RRT::pose_callback_rrt(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) {
     // The pose callback when subscribed to particle filter's inferred pose
     // The RRT main loop happens here
     // Args:
@@ -133,18 +146,26 @@ void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) 
     RRT_Node start;
     start.x = 0;
     start.y = 0;
+    start.is_root = true;
     tree.push_back(start);
 
     // get goal point
-    auto goal = getGoal(car_pose_.position.x, car_pose_.position.y);
-    bool goal_found = false;
+    auto goal = get_goal(car_pose_.position.x, car_pose_.position.y, x_points, y_points, L_goal);
+    publish_goal(goal);
 
-    // RRT
+    // RRT initializations
+    bool goal_found = false;
     int count = 0;
     RRT_Node new_node;
+    clear_tree();
+
     while(!goal_found && count<num_samples){
         count++;
+
+        // sample point
         auto sampled_point = sample();
+
+        // get nearest node
         int tree_size = tree.size();
         int nearest_idx = nearest(tree, sampled_point);
         RRT_Node nearest_node;
@@ -152,31 +173,19 @@ void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) 
             nearest_node = tree[nearest_idx];
         }
         else{
-            RCLCPP_INFO(this->get_logger(), "NEAREST NODE RETURNED INVALID INDEX");
+            RCLCPP_INFO(this->get_logger(), "NEAREST NODE INDEX INVALID");
+            continue;
         }
+        
+        // steer
         new_node = steer(nearest_node, sampled_point, tree);
 
+        // check for collisions
         if (!check_collision(nearest_node, new_node))
         {
-            // visualization_msgs::msg::Marker node_marker;
-            // node_marker.header.frame_id = "ego_racecar/base_link";
-            // node_marker.header.stamp = this->get_clock()->now();
-            // node_marker.ns = "steer";
-            // node_marker.type = visualization_msgs::msg::Marker::CYLINDER;
-            // node_marker.action = visualization_msgs::msg::Marker::ADD;
-            // node_marker.pose.position.x = new_node.x;
-            // node_marker.pose.position.y = new_node.y;
-            // node_marker.pose.position.z = 0.2;
-            // node_marker.scale.x = 0.1;
-            // node_marker.scale.y = 0.1;
-            // node_marker.scale.z = 0.1;
-            // node_marker.color.a = 1.0;
-            // node_marker.color.r = 0.0;
-            // node_marker.color.g = 1.0;
-            // node_marker.color.b = 0.0;
-            // steer_pub->publish(node_marker);
-
             tree.push_back(new_node);
+
+            // check if goal is found
             if (is_goal(new_node, goal[0], goal[1])){
                 goal_found = true;
             }
@@ -185,8 +194,184 @@ void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) 
 
     // get path
     auto nodes = find_path(tree, new_node);
+    publish_tree(tree);
     publish_path(nodes);
 
+    // transform path
+    vector<float> path_x_points, path_y_points;
+    transform_path(path_x_points, path_y_points, nodes);
+
+    // pure pursuit to follow path
+    pure_pursuit(path_x_points, path_y_points, car_pose_);
+
+}
+
+void RRT::pose_callback_rrt_star(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) {
+    RCLCPP_INFO(this->get_logger(), "running rrt*");
+
+    car_pose_ = pose_msg->pose.pose;
+    vector<RRT_Node> tree;
+
+    // make start node
+    RRT_Node start;
+    start.x = 0;
+    start.y = 0;
+    start.is_root = true;
+    tree.push_back(start);
+
+    // get goal point
+    auto goal = get_goal(car_pose_.position.x, car_pose_.position.y, x_points, y_points, L_goal);
+    publish_goal(goal);
+
+    // RRT initializations
+    bool goal_found = false;
+    int count = 0;
+    RRT_Node new_node;
+    clear_tree();
+
+    // rrt* loop
+    while(!goal_found && count<num_samples){
+        count++;
+
+        // sample point
+        auto sampled_point = sample();
+
+        // get nearest node
+        int tree_size = tree.size();
+        int nearest_idx = nearest(tree, sampled_point);
+        RRT_Node nearest_node;
+        if (nearest_idx < tree_size && nearest_idx >= 0){
+            nearest_node = tree[nearest_idx];
+        }
+        else{
+            RCLCPP_INFO(this->get_logger(), "NEAREST NODE INDEX INVALID");
+            continue;
+        }
+        
+        // steer
+        new_node = steer(nearest_node, sampled_point, tree);
+
+        // get neighborhood
+        auto neighborhood = near(tree, new_node);
+
+        // find lowest cost neighbor
+        double min_cost = numeric_limits<float>::max();
+        int min_neighbor;
+        for (auto idx : neighborhood){
+            auto neighbor = tree[idx];
+            double total_cost = cost(tree, neighbor) + line_cost(neighbor, new_node);
+            if (total_cost < min_cost){
+                min_cost = total_cost;
+                min_neighbor = idx;
+            }
+        }
+
+        // add to tree
+        if (!check_collision(tree[min_neighbor], new_node)){
+            new_node.parent = min_neighbor;
+            tree.push_back(new_node);
+
+            // check if goal is found
+            if (is_goal(new_node, goal[0], goal[1])){
+                goal_found = true;
+                break;
+            }
+
+            // rewire
+            for (auto idx : neighborhood){
+                auto neighbor = tree[idx];
+                if ((min_cost + line_cost(neighbor, new_node)) < cost(tree, neighbor) && !check_collision(neighbor, new_node)){
+                    neighbor.parent = get_node_index(tree, new_node);
+                }
+            }
+        }
+    }
+
+    // get path
+    auto nodes = find_path(tree, new_node);
+    publish_tree(tree);
+    publish_path(nodes);
+
+    // transform path
+    vector<float> path_x_points, path_y_points;
+    transform_path(path_x_points, path_y_points, nodes);
+
+    // pure pursuit to follow path
+    pure_pursuit(path_x_points, path_y_points, car_pose_);
+}
+
+void RRT::clear_tree() {
+    visualization_msgs::msg::MarkerArray tree_markers;
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "ego_racecar/base_link";
+    marker.header.stamp = this->get_clock()->now();  
+    marker.action = 3; //visualization_msgs::msg::Marker::DELETEALL;
+    marker.ns = "tree";
+    tree_markers.markers.push_back(marker);
+
+    tree_pub->publish(tree_markers);
+}
+
+void RRT::publish_tree(const std::vector<RRT_Node>& nodes) {
+
+    visualization_msgs::msg::MarkerArray tree_markers;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto& node = nodes[i];
+        if (!node.is_root) {
+
+            auto parent_node = nodes[node.parent];
+
+            visualization_msgs::msg::Marker marker;
+            marker.header.frame_id = "ego_racecar/base_link";
+            marker.id = i;
+            marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+            marker.action = visualization_msgs::msg::Marker::ADD;
+            marker.ns = "tree";
+            marker.scale.x = 0.01;
+            marker.color.a = 1.0;
+            marker.color.r = 0.0;
+            marker.color.g = 0.0;
+            marker.color.b = 1.0;
+
+            // parent node
+            geometry_msgs::msg::Point start;
+            start.x = parent_node.x;
+            start.y = parent_node.y;
+            start.z = 0.0;
+
+            // current node
+            geometry_msgs::msg::Point end;
+            end.x = node.x;
+            end.y = node.y;
+            end.z = 0.0;
+
+            marker.points.push_back(start);
+            marker.points.push_back(end);
+
+            tree_markers.markers.push_back(marker);
+        }
+    }
+
+    tree_pub->publish(tree_markers);
+}
+
+void RRT::publish_goal(vector<double> goal){
+    // make goal marker
+    goal_marker.header.frame_id = "ego_racecar/base_link";
+    goal_marker.header.stamp = this->get_clock()->now();
+    goal_marker.ns = "goal";
+    goal_marker.type = visualization_msgs::msg::Marker::CYLINDER;
+    goal_marker.action = visualization_msgs::msg::Marker::ADD;
+    goal_marker.pose.position.x = goal[0];
+    goal_marker.pose.position.y = goal[1];
+    goal_marker.pose.position.z = 0.2;
+    goal_marker.scale.x = 0.1;
+    goal_marker.scale.y = 0.1;
+    goal_marker.scale.z = 0.1;
+    goal_marker.color.a = 1.0;
+    goal_marker.color.r = 0.0;
+    goal_marker.color.g = 1.0;
+    goal_marker.color.b = 0.0;
 }
 
 std::vector<double> RRT::sample() {
@@ -212,7 +397,8 @@ double RRT::get_dist(double &x1, double &y1, double &x2, double &y2){
     return sqrt(pow(x2-x1,2) + pow(y2-y1,2));
 }
 
-int RRT::get_node_index(const std::vector<RRT_Node> &tree, const RRT_Node &node){
+int RRT::get_node_index(const std::vector<RRT_Node> &tree, const RRT_Node &node)
+{
     int n = tree.size();
     const double EPSILON = 1e-6;
     for (int i=0; i<n; i++){
@@ -224,6 +410,48 @@ int RRT::get_node_index(const std::vector<RRT_Node> &tree, const RRT_Node &node)
     return 0;
 }
 
+void RRT::transform_path(vector<float>& path_x_points, vector<float>& path_y_points, const vector<RRT_Node>& path){
+    for (const auto node : path){
+
+        // transform car frame to map frame
+        geometry_msgs::msg::PointStamped map_point, car_point;
+        car_point.header.frame_id = "ego_racecar/base_link";
+        car_point.header.stamp = rclcpp::Time(0);
+        car_point.point.x = node.x;
+        car_point.point.y = node.y;
+        car_point.point.z = 0.0;
+
+        try {
+            auto transformStamped = tf_buffer->lookupTransform("map", car_point.header.frame_id, car_point.header.stamp, rclcpp::Duration(1, 0));
+            tf2::doTransform(car_point, map_point, transformStamped);
+        }
+        catch (tf2::TransformException &ex) {
+            RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "Loaded Waypoints");
+
+            RCLCPP_ERROR(rclcpp::get_logger("RRT"), "Could not transform point: %s", ex.what());
+        }
+
+        path_x_points.push_back(map_point.point.x);
+        path_y_points.push_back(map_point.point.y);
+    }
+}
+
+void RRT::pure_pursuit(const vector<float>& path_x_points, const vector<float>& path_y_points, const geometry_msgs::msg::Pose& car_pose){
+
+    // get next goal point in path
+    auto goal = get_goal(car_pose.position.x, car_pose.position.y, path_x_points, path_y_points, L_follow);
+
+    // calculate curvature/steering angle
+    float gamma = 2 * goal[1] / pow(L_follow,2);
+    float steering_angle = steering_gain * gamma;
+    steering_angle = max(min_steer, min(steering_angle, max_steer)); // clip
+
+    // publish drive message
+    auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
+    drive_msg.drive.speed = velocity;
+    drive_msg.drive.steering_angle = steering_angle;
+    drive_pub_->publish(drive_msg);
+}
 
 int RRT::nearest(std::vector<RRT_Node> &tree, std::vector<double> &sampled_point) {
     // This method returns the nearest node on the tree to the sampled point
@@ -311,25 +539,7 @@ bool RRT::check_collision(RRT_Node &nearest_node, RRT_Node &new_node) {
         int idx = x_cell + y_cell*grid_size;
         if (x_cell<grid_size && x_cell>0 && y_cell<grid_size && y_cell>0 && idx<pow(grid_size,2)){
             if (og_.data[idx]>1){
-
-                // visualization_msgs::msg::Marker node_marker;
-                // node_marker.header.frame_id = "ego_racecar/base_link";
-                // node_marker.header.stamp = this->get_clock()->now();
-                // node_marker.ns = "collisions";
-                // node_marker.type = visualization_msgs::msg::Marker::CYLINDER;
-                // node_marker.action = visualization_msgs::msg::Marker::ADD;
-                // node_marker.pose.position.x = x;
-                // node_marker.pose.position.y = y;
-                // node_marker.pose.position.z = 0.2;
-                // node_marker.scale.x = 0.1;
-                // node_marker.scale.y = 0.1;
-                // node_marker.scale.z = 0.1;
-                // node_marker.color.a = 1.0;
-                // node_marker.color.r = 0.0;
-                // node_marker.color.g = 1.0;
-                // node_marker.color.b = 0.0;
-                // samples_pub->publish(node_marker);
-                // return true;
+                return true;
             }
         }
     }
@@ -389,7 +599,7 @@ std::vector<RRT_Node> RRT::find_path(std::vector<RRT_Node> &tree, RRT_Node &late
     return found_path;
 }
 
-void RRT::publish_path(std::vector<RRT_Node> nodes){
+void RRT::publish_path(vector<RRT_Node> nodes){
     nav_msgs::msg::Path path;
     path.header.frame_id = "ego_racecar/base_link";
     path.header.stamp = this->now();
@@ -400,7 +610,7 @@ void RRT::publish_path(std::vector<RRT_Node> nodes){
         pose.header.stamp = path.header.stamp;
         pose.pose.position.x = node.x;
         pose.pose.position.y = node.y;
-        pose.pose.position.z = 0.3;
+        pose.pose.position.z = 0.1;
         pose.pose.orientation.w = 1.0;
         path.poses.push_back(pose);
     }
@@ -412,7 +622,7 @@ void RRT::publish_path(std::vector<RRT_Node> nodes){
 // load pre-recorded waypoints from csv
 void RRT::load_waypoints(vector<float> &x_points, vector<float> &y_points)
 {
-    ifstream csv_file("/sim_ws/src/f1tenth_lab5_sub/waypoints/waypoints2.csv");
+    ifstream csv_file("/sim_ws/src/f1tenth_lab5/waypoints/waypoints2.csv");
     string line;
     size_t id = 0;
     int line_count = 0;
@@ -464,16 +674,16 @@ void RRT::load_waypoints(vector<float> &x_points, vector<float> &y_points)
     RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "Loaded Waypoints");
 }
 
-// get the next goal waypoint to move towards
-vector<double> RRT::getGoal(const double& current_x, const double& current_y)
+// get the next goal waypoint for RRT to plan to
+vector<double> RRT::get_goal(const double& current_x, const double& current_y, const vector<float>& x_values, const vector<float>& y_values, const double lookahead)
 {
     // find closest waypoint to current position
-    int num_waypoints = x_points.size();
+    int num_waypoints = x_values.size();
     int closest_idx = 0;
     float closest_dist = numeric_limits<float>::max();
     for (int i=0; i<num_waypoints; ++i)
     {
-        float dist = sqrt(pow(x_points[i]-current_x, 2) + pow(y_points[i]-current_y, 2));
+        float dist = sqrt(pow(x_values[i]-current_x, 2) + pow(y_values[i]-current_y, 2));
         if (dist < closest_dist)
         {
             closest_idx = i;
@@ -487,8 +697,8 @@ vector<double> RRT::getGoal(const double& current_x, const double& current_y)
     while(!found_goal && goal_idx < num_waypoints)
     {
         ++goal_idx;
-        float goal_dist = sqrt(pow(x_points[goal_idx]-current_x, 2) + pow(y_points[goal_idx]-current_y, 2));
-        if (goal_dist > L)
+        float goal_dist = sqrt(pow(x_values[goal_idx]-current_x, 2) + pow(y_values[goal_idx]-current_y, 2));
+        if (goal_dist > lookahead)
         {
             found_goal = true;
         }
@@ -498,8 +708,8 @@ vector<double> RRT::getGoal(const double& current_x, const double& current_y)
     geometry_msgs::msg::PointStamped map_goal, car_goal;
     map_goal.header.frame_id = "map";
     map_goal.header.stamp = rclcpp::Time(0);
-    map_goal.point.x = x_points[goal_idx];
-    map_goal.point.y = y_points[goal_idx];
+    map_goal.point.x = x_values[goal_idx];
+    map_goal.point.y = y_values[goal_idx];
     map_goal.point.z = 0.0;
 
     try {
@@ -514,67 +724,59 @@ vector<double> RRT::getGoal(const double& current_x, const double& current_y)
     goal.push_back(car_goal.point.x);
     goal.push_back(car_goal.point.y);
 
-    // make goal marker
-    goal_marker.header.frame_id = "ego_racecar/base_link";
-    goal_marker.header.stamp = this->get_clock()->now();
-    goal_marker.ns = "goal";
-    goal_marker.type = visualization_msgs::msg::Marker::CYLINDER;
-    goal_marker.action = visualization_msgs::msg::Marker::ADD;
-    goal_marker.pose.position.x = goal[0];
-    goal_marker.pose.position.y = goal[1];
-    goal_marker.pose.position.z = 0.2;
-    goal_marker.scale.x = 0.1;
-    goal_marker.scale.y = 0.1;
-    goal_marker.scale.z = 0.1;
-    goal_marker.color.a = 1.0;
-    goal_marker.color.r = 1.0;
-    goal_marker.color.g = 0.0;
-    goal_marker.color.b = 0.0;
-
     return goal;
 }
 
 
 // RRT* methods
-// double RRT::cost(std::vector<RRT_Node> &tree, RRT_Node &node) {
-//     // This method returns the cost associated with a node
-//     // Args:
-//     //    tree (std::vector<RRT_Node>): the current tree
-//     //    node (RRT_Node): the node the cost is calculated for
-//     // Returns:
-//     //    cost (double): the cost value associated with the node
+double RRT::cost(std::vector<RRT_Node> &tree, RRT_Node &node) {
+    // This method returns the cost associated with a node
+    // Args:
+    //    tree (std::vector<RRT_Node>): the current tree
+    //    node (RRT_Node): the node the cost is calculated for
+    // Returns:
+    //    cost (double): the cost value associated with the node
 
-//     double cost = 0;
-//     // TODO: fill in this method
+    double cost = 0;
+    auto child = node;
+    
+    while (!child.is_root){
+        auto parent = tree[child.parent];
+        cost += get_dist(child.x, child.y, parent.x, parent.y);
+        child = parent;
+    }
 
-//     return cost;
-// }
+    return cost;
+}
 
-// double RRT::line_cost(RRT_Node &n1, RRT_Node &n2) {
-//     // This method returns the cost of the straight line path between two nodes
-//     // Args:
-//     //    n1 (RRT_Node): the RRT_Node at one end of the path
-//     //    n2 (RRT_Node): the RRT_Node at the other end of the path
-//     // Returns:
-//     //    cost (double): the cost value associated with the path
+double RRT::line_cost(RRT_Node &n1, RRT_Node &n2) {
+    // This method returns the cost of the straight line path between two nodes
+    // Args:
+    //    n1 (RRT_Node): the RRT_Node at one end of the path
+    //    n2 (RRT_Node): the RRT_Node at the other end of the path
+    // Returns:
+    //    cost (double): the cost value associated with the path
 
-//     double cost = 0;
-//     // TODO: fill in this method
+    return get_dist(n1.x, n1.y, n2.x, n2.y);
+}
 
-//     return cost;
-// }
+std::vector<int> RRT::near(std::vector<RRT_Node> &tree, RRT_Node &node) {
+    // This method returns the set of Nodes in the neighborhood of a 
+    // node.
+    // Args:
+    //   tree (std::vector<RRT_Node>): the current tree
+    //   node (RRT_Node): the node to find the neighborhood for
+    // Returns:
+    //   neighborhood (std::vector<int>): the index of the nodes in the neighborhood
 
-// std::vector<int> RRT::near(std::vector<RRT_Node> &tree, RRT_Node &node) {
-//     // This method returns the set of Nodes in the neighborhood of a 
-//     // node.
-//     // Args:
-//     //   tree (std::vector<RRT_Node>): the current tree
-//     //   node (RRT_Node): the node to find the neighborhood for
-//     // Returns:
-//     //   neighborhood (std::vector<int>): the index of the nodes in the neighborhood
+    std::vector<int> neighborhood;
 
-//     std::vector<int> neighborhood;
-//     // TODO:: fill in this method
+    int n = tree.size();
+    for (int i=0; i<n; i++){
+        if (get_dist(tree[i].x, tree[i].y, node.x, node.y) < neighbor_thresh){
+            neighborhood.push_back(i);
+        }
+    }
 
-//     return neighborhood;
-// }
+    return neighborhood;
+}
