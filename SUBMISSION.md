@@ -1,4 +1,9 @@
-# Lab 1: Automatic Emergency Braking
+# Lab 6: Motion Planning
 
 ## Video Link
-(FILL ME IN)
+
+### Simulation (RRT Star):
+https://youtu.be/v10lhY4rzlQ 
+
+### Hardware:
+https://youtu.be/JvZ5VUmy-5g?si=D8l0y60mWUoM17-q

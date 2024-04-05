@@ -64,11 +64,11 @@ RRT::RRT(): rclcpp::Node("rrt_node"), gen((std::random_device())()), tf_buffer(s
     num_samples = 1000; // number of sampled points (m)
     L_goal = 1.5; // lookahead dist for getting a goal waypoint (m)
     L_follow = 0.4; // lookahead dist for pure pursuit along RRT path (m)
-    velocity = 0.5;
-    min_steer = -M_PI/3;
-    max_steer = M_PI/3;
-    steering_gain = 0.3;
-    neighbor_thresh = 0.6;
+    velocity = 0.5; // car velocity (m/s)
+    min_steer = -M_PI/3; // clip steer for pure pursuit
+    max_steer = M_PI/3; // clip steer for pure pursuit
+    steering_gain = 0.3; // P gain for pure pursuit
+    neighbor_thresh = 0.6; // RRT* threshold
 
     // load waypoints
     load_waypoints(x_points, y_points);
